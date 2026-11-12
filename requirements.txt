@@ -1,0 +1,6 @@
+google-adk
+litellm
+google-genai
+streamlit
+python-dotenv
+pandas

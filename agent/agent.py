@@ -21,7 +21,13 @@ import uuid
 from typing import Any
 
 from . import prompts
-from .guardrails import append_audit, enforce_price_floor, block_injection
+from .guardrails import (
+    INJECTION,
+    append_audit,
+    block_injection,
+    enforce_price_floor,
+    redact_pii,
+)
 from .tools import check_stock, get_price_rule, search_past_quotes
 
 # Lab 1 / Lab 2 / Lab 4 / Lab 5 notebooks: use the Gemini Developer API, not Vertex.
@@ -118,11 +124,17 @@ except Exception:  # google-adk may not be installed yet
 
 
 def _as_dict(value: Any) -> Any:
+    """output_key values arrive as text; models often wrap JSON in ```json fences."""
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("```"):
+            text = text.strip("`").strip()
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
         try:
-            return json.loads(value)
+            return json.loads(text)
         except json.JSONDecodeError:
             return value
     return value
@@ -245,7 +257,7 @@ class AgentChatSession:
     Extra: after drain, read session.state so Streamlit can show output_key values.
     """
 
-    def __init__(self, agent, app_name=APP_NAME, user_id="local-demo"):
+    def __init__(self, agent, app_name=APP_NAME, user_id="local-demo", state=None):
         from google.adk.runners import Runner
         from google.adk.sessions import InMemorySessionService
 
@@ -265,6 +277,7 @@ class AgentChatSession:
                 app_name=self.app_name,
                 user_id=self.user_id,
                 session_id=self.session_id,
+                state=state or {},  # seeds {raw_enquiry} used by the intake_parser prompt
             )
         )
 
@@ -305,58 +318,44 @@ class AgentChatSession:
         return dict(getattr(sess, "state", {}) or {})
 
 
+def blocked_result(reason: str) -> dict:
+    """Result returned when the Lab 2 injection blocklist catches the enquiry up front."""
+    return {
+        "blocked": True,
+        "block_reason": reason,
+        "used_stub": False,
+        "approval_status": "blocked",
+    }
+
+
 def run_quotation_pipeline(raw_enquiry: str) -> dict:
     """Run quotation_pipeline with the Lab 1/4/5 session helper; return output_key state."""
     enquiry_text = raw_enquiry or ""
+
+    # Lab 2 guardrail, applied up front too: stop before any model call.
+    if any(p in enquiry_text.lower() for p in INJECTION):
+        append_audit({"event": "blocked", "reason": "prompt_injection", "sent": False})
+        return blocked_result("Request blocked by safety policy (prompt injection phrase).")
+
     if root_agent is None:
         stub = stub_result(enquiry_text)
         stub["pipeline_error"] = "root_agent not built (install google-adk from requirements.txt)."
         return stub
     try:
-        chat = AgentChatSession(root_agent)
-        chat.send(enquiry_text)
+        # The intake_parser prompt contains {raw_enquiry}; ADK raises
+        # "Context variable not found" unless that key exists in session state.
+        # Redact PII here because state is injected into the instruction, not
+        # into the contents that the before_model_callback inspects.
+        chat = AgentChatSession(root_agent, state={"raw_enquiry": redact_pii(enquiry_text)})
+        chat.send(redact_pii(enquiry_text))
         out = _state_to_result(chat.state(), enquiry_text)
         out["used_stub"] = False
         return out
-    except TypeError:
-        # Some ADK builds reject auto_create_session=True — retry without it.
-        try:
-            from google.adk.runners import Runner
-            from google.adk.sessions import InMemorySessionService
-            from google.genai import types as genai_types
-
-            session_service = InMemorySessionService()
-            session_id = f"session_{uuid.uuid4().hex[:8]}"
-            _maybe_sync(
-                session_service.create_session(
-                    app_name=APP_NAME, user_id="local-demo", session_id=session_id
-                )
-            )
-            runner = Runner(
-                agent=root_agent, app_name=APP_NAME, session_service=session_service
-            )
-            message = genai_types.Content(
-                role="user", parts=[genai_types.Part.from_text(text=enquiry_text)]
-            )
-            events = _maybe_sync(
-                runner.run(user_id="local-demo", session_id=session_id, new_message=message)
-            )
-            for _ in events:
-                pass
-            sess = _maybe_sync(
-                session_service.get_session(
-                    app_name=APP_NAME, user_id="local-demo", session_id=session_id
-                )
-            )
-            state = dict(getattr(sess, "state", {}) or {})
-            out = _state_to_result(state, enquiry_text)
-            out["used_stub"] = False
-            return out
-        except Exception as exc:
-            stub = stub_result(enquiry_text)
-            stub["pipeline_error"] = f"{type(exc).__name__}: {exc}. Showing stub output."
-            return stub
-    except Exception as exc:
+    except Exception as exc:  # never show the key; type + message only
         stub = stub_result(enquiry_text)
-        stub["pipeline_error"] = f"{type(exc).__name__}: {exc}. Showing stub output."
+        message = str(exc)
+        key = os.environ.get("GOOGLE_API_KEY")
+        if key:
+            message = message.replace(key, "[REDACTED_KEY]")
+        stub["pipeline_error"] = f"{type(exc).__name__}: {message}"
         return stub

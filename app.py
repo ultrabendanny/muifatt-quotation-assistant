@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from agent.agent import run_quotation_pipeline
+from agent.agent import MODEL, run_quotation_pipeline
 from agent.guardrails import append_audit, enforce_price_floor
 from agent.tools import format_quote_pdf
 
@@ -24,16 +24,18 @@ os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "FALSE")
 
 
 def get_google_api_key() -> str:
-    """Read GOOGLE_API_KEY from .env (local) or Streamlit secrets (Cloud).
+    """Fill GOOGLE_API_KEY from .env (local) or st.secrets (Streamlit Cloud).
 
-    Labs use os.environ["GOOGLE_API_KEY"] (Colab userdata / getpass). Here the
-    same env var is filled from .env or st.secrets — never hardcoded.
+    Labs use os.environ["GOOGLE_API_KEY"] (Colab userdata / getpass). ADK and the
+    Gemini client read that env var, so st.secrets is copied into it. The key is
+    never hardcoded, printed, or written to disk.
     """
     key = os.getenv("GOOGLE_API_KEY")
     if not key:
         try:
-            key = st.secrets["GOOGLE_API_KEY"]
-        except Exception:
+            if "GOOGLE_API_KEY" in st.secrets:
+                key = st.secrets["GOOGLE_API_KEY"]
+        except Exception:  # no secrets file locally
             key = None
     if not key:
         st.error(
@@ -41,7 +43,7 @@ def get_google_api_key() -> str:
             "For Streamlit Cloud, add it in the app Secrets. Do not paste it into this screen."
         )
         st.stop()
-    os.environ["GOOGLE_API_KEY"] = key
+    os.environ["GOOGLE_API_KEY"] = str(key).strip()
     return key
 
 
@@ -74,18 +76,26 @@ if result:
     cost = result.get("cost_trace") or {}
     pricing = result.get("pricing") or {}
 
+    if result.get("blocked"):
+        st.error(result.get("block_reason", "Request blocked by safety policy."))
+        st.caption("Lab 2 guardrail: the injection phrase was caught before any model call.")
+        st.stop()
+
+    # Mode line: live ADK pipeline on Gemini vs. stub example output.
     if result.get("used_stub"):
-        st.info(
-            "Showing stub example output (ADK runner not used yet). "
-            "Install requirements and set GOOGLE_API_KEY, then rerun."
+        st.caption("Mode: stub")
+        st.warning(
+            "The live pipeline failed, so this is stub example output, not a real "
+            f"{MODEL} result.\n\n"
+            f"Reason: {result.get('pipeline_error') or 'unknown'}"
         )
-        if result.get("pipeline_error"):
-            st.caption(result["pipeline_error"])
+    else:
+        st.caption(f"Mode: live ({MODEL})")
 
     st.subheader("Parsed lines")
     lines = enquiry.get("lines") if isinstance(enquiry, dict) else None
     if lines:
-        st.dataframe(pd.DataFrame(lines), use_container_width=True)
+        st.dataframe(pd.DataFrame(lines), width="stretch")
     else:
         st.json(enquiry)
     if isinstance(enquiry, dict) and enquiry.get("parse_warnings"):
@@ -96,7 +106,7 @@ if result:
         st.info("Figures are example only — not live customer pricing.")
     draft_lines = draft.get("lines") if isinstance(draft, dict) else None
     if draft_lines:
-        st.dataframe(pd.DataFrame(draft_lines), use_container_width=True)
+        st.dataframe(pd.DataFrame(draft_lines), width="stretch")
         st.write(f"Subtotal: {draft.get('currency')} {draft.get('subtotal')}")
     else:
         st.json(draft)
@@ -126,6 +136,7 @@ if result:
         and isinstance(judge, dict)
         and judge.get("pass")
     )
+    quote_id = draft.get("quote_id") if isinstance(draft, dict) else None
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Approve (do not send)", disabled=not can_approve):
@@ -133,23 +144,31 @@ if result:
             append_audit(
                 {
                     "event": "approved",
-                    "quote_id": draft.get("quote_id") if isinstance(draft, dict) else None,
+                    "quote_id": quote_id,
                     "sent": False,
                     "judge_total": judge.get("total") if isinstance(judge, dict) else None,
                 }
             )
-            pdf = format_quote_pdf(draft, "approved")
-            st.success("Approved and written to the audit log. Not sent to any customer.")
-            if pdf.get("ok"):
-                st.caption(f"Local PDF preview path (not emailed): {pdf.get('path')}")
     with c2:
         if st.button("Reject"):
             result["approval_status"] = "rejected"
-            append_audit(
-                {
-                    "event": "rejected",
-                    "quote_id": draft.get("quote_id") if isinstance(draft, dict) else None,
-                    "sent": False,
-                }
+            append_audit({"event": "rejected", "quote_id": quote_id, "sent": False})
+
+    # Status is kept in the result (session_state), so it survives the rerun that
+    # st.download_button triggers.
+    status = result.get("approval_status")
+    if status == "approved":
+        st.success("Approved and written to the audit log. Not sent to any customer.")
+        pdf = format_quote_pdf(draft, "approved")
+        if pdf.get("ok"):
+            st.download_button(
+                "Download quote PDF",
+                data=pdf["pdf_bytes"],
+                file_name=pdf["filename"],
+                mime="application/pdf",
             )
-            st.warning("Rejected. Nothing was sent.")
+            st.caption("Saved to your device only. Nothing is emailed or shared.")
+        else:
+            st.error(f"Could not build the PDF: {pdf.get('error')}")
+    elif status == "rejected":
+        st.warning("Rejected. Nothing was sent.")

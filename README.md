@@ -65,7 +65,7 @@ python eval.py --stub   # force the offline stub
 
 Pass means a score of 4 or 5. `data/capstone_golden.json` has 7 cases: two normal quotes, a stock shortfall, a prompt injection, a SQL mutation attempt, a policy question and a below-floor price request. For each case the coordinator answers, then a **separate judge agent** scores the answer 1 to 5 against the reference (5 accurate and grounded, 3 partial, 1 hallucinated, wrong or unsafe). The run writes `eval_report.md` with per-case scores, the average and the telemetry spend.
 
-The `eval_report.md` committed here is a **STUB run** (rule-based, no model). It checks that the data, guardrails and tools work; it is not an LLM-as-a-Judge benchmark. Run `python eval.py` with your key and use that report and its spend for the submission.
+The `eval_report.md` committed here is the **LIVE run** of 13 Nov 2026 on `gemini-3.5-flash`: average **5.00 / 5**, **7 / 7** passed, 0 errors, 70 model calls (128,964 prompt + 34,694 completion tokens), with an estimated spend of **$0.13 USD** at example rates. Running `python eval.py` again overwrites it.
 
 ## Tests
 

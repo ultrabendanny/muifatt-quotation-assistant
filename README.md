@@ -1,103 +1,81 @@
-# Quotation Assistant (Day 3 capstone draft)
+# Enterprise Quotation Assistant (FDE capstone)
 
-Internal demo app: enquiry in → draft quote out → a human Approves or Rejects. The app **never sends** a quote to a customer.
+A multi-agent quoting desk assistant built with **Google ADK** and **Streamlit**. It answers price, stock and policy questions and drafts quotes from an **SQLite database** and **markdown policy documents**, found at run time through MCP-style discovery tools. A human approves every draft; the app never sends a quote.
 
-All customers, SKUs, and prices in this folder are **labelled examples only**. Do not put real quotes, names, or API keys in Codeshare (it is public) or in GitHub.
+**All data is invented example data** (`EXAMPLE-RESIN-001`, "Example Customer A", ...). Do not put real customers, prices, codes or API keys in this repo. It is public.
 
-Full design notes, source mapping, and “How to explain it” lines are in [`GUIDE.md`](GUIDE.md).
+## Architecture summary (for the submission)
 
-## Requirements
+The `enterprise_analyst_agent` coordinator delegates to three specialist agents (a data and pricing analyst, a policy checker and a quote drafter) through ADK `AgentTool`, and a `SequentialAgent` / `ParallelAgent` pipeline (intake parser, research, drafter, reviewer) produces the structured quote. Agents hold no schema or price in their prompts. They discover the data at run time through MCP discovery primitives: `mcp_list_tables()`, `mcp_describe_table()`, `mcp_read_query()`, `mcp_list_policies()` and `mcp_read_policy()`. Because the agent lists tables on every question, a table added later (the sidebar "Live migration simulator" adds `supplier_lead_times`) is used immediately with no change to agent code. The tools follow protocol-level least privilege: no mutation tool exists to be registered, and the write connection used by the migration button is a separate human-only function.
 
-The lecturer asked for a `requirements.txt`. It is in this folder (unpinned, as in the draft):
+Safety has two tiers. At the **input level**, a `before_model_guardrail` callback redacts PII in place (emails, phone numbers, credit cards, Malaysian IC numbers) and short-circuits prompt injection with "Request blocked by safety policy." before the model is called. At the **data level**, `is_sql_mutation` uses `sqlparse` statement and token analysis to reject DROP, DELETE, UPDATE, INSERT, ALTER, TRUNCATE, CREATE, REPLACE, ATTACH, PRAGMA and stacked statements, and every connection is opened with `file:...enterprise.db?mode=ro`, so SQLite itself refuses writes even if the parser were bypassed. An `after_model_cost_tracker` callback reads `usage_metadata` on every model call and shows prompt tokens, completion tokens and estimated USD in the sidebar. An LLM-as-a-Judge harness (`eval.py`) scores the agent against a golden set.
 
-```txt
-google-adk
-litellm
-google-genai
-streamlit
-python-dotenv
-pandas
-```
+## The six pillars
 
-Labs 1, 2, 4, and 5 install `google-adk` and `litellm`. The notebooks also `from google.genai import types`, so `google-genai` is listed here. Do not add ChromaDB until the Lab 3 RAG tool is wired.
+| Pillar | Where |
+| --- | --- |
+| 1 Multi-agent coordinator + specialists | `agent/agent.py` |
+| 2 SQLite + policies, queried by discovery tools | `agent/db.py`, `seed_db.py`, `data/enterprise.db`, `policies/` |
+| 3 Two-tier guardrails | `agent/guardrails.py` (input), `agent/mcp_tools.py` (`is_sql_mutation`, `mode=ro`) |
+| 4 Cost tracking | `agent/telemetry.py`, sidebar widget in `app.py` |
+| 5 Judge harness | `eval.py`, `data/capstone_golden.json`, `eval_report.md` |
+| 6 Streamlit Cloud | `app.py`, `requirements.txt`, `.streamlit/secrets.toml.example` |
 
-Add the Langfuse SDK later if the Day 3 starter names it.
+## Real MCP or function tools?
 
-## Secrets (never hardcode)
+**Function tools named as the course's MCP discovery primitives.** This is not a separate MCP server process.
 
-- Local: copy `.env.example` to `.env` and set `GOOGLE_API_KEY=` there only (Day 1 p.62, p.72).
-- Streamlit Community Cloud: set the same name in app Secrets (`st.secrets["GOOGLE_API_KEY"]`) — General practice.
-- `.env` and `.streamlit/secrets.toml` are in `.gitignore`. They are also in `.dockerignore` so they are not baked into a Cloud Run image.
-- Do not paste the key into Codeshare, GitHub, screenshots, or `app.py`.
+Why: the capstone notebook (Step 9) and the course's `bank_mcp_virtual_analyst_streamlit` notebook use exactly these `mcp_*` names as in-process ADK function tools. A real stdio MCP server (`McpToolset` + `mcp_db_server.py`, shown in `true_mcp_protocol_streamlit_participants.ipynb`) needs a subprocess and `asyncio.run` inside Streamlit, which adds failure modes on Streamlit Community Cloud. The behaviour the capstone grades (runtime discovery, least privilege, AST guard, read-only URI) is the same. The `mcp` package is therefore **not** in `requirements.txt`.
 
-## Run locally (Anaconda Prompt, not plain cmd)
-
-Class notes: use **Anaconda Prompt** so the environment is on the PATH.
-
-1. `cd` into this folder (`quotation_assistant`).
-2. `pip install -r requirements.txt`
-3. Copy `.env.example` to `.env` and set `GOOGLE_API_KEY` there only.
-4. `streamlit run app.py`
-5. Open the local URL Streamlit prints (usually `http://localhost:8501`).
-
-Optional: `adk web .` still works for debugging if `root_agent` loads (Day 1 Lab 1). The pipeline lives in `agent/agent.py`.
-
-If `google-adk` is not installed, the UI still opens and shows **stub example output** so you can walk through the screen. `run_quotation_pipeline` uses the same `AgentChatSession` / `Runner.run` helper as the Lab 1, Lab 4, and Lab 5 notebooks. The default model is `MODEL = "gemini-3.5-flash"` (what those labs use).
-
-## Streamlit Community Cloud (General practice)
-
-1. Create a **private** GitHub repo.
-2. Confirm `.env` and `.streamlit/secrets.toml` are **not** in the commit.
-3. Deploy the repo; in the Cloud app Secrets add `GOOGLE_API_KEY` (same name as local).
-
-Good for a class demo. Course production targets remain Docker → Cloud Run and/or Vertex AI Agent Engine (Day 1 p.80).
-
-## Docker / Cloud Run (Day 1 p.80)
+## Run locally
 
 ```bash
-docker build -t quotation-assistant .
-docker run --rm -p 8080:8080 -e GOOGLE_API_KEY -e PORT=8080 quotation-assistant
+pip install -r requirements.txt
+python seed_db.py            # optional: app.py also creates data/enterprise.db if it is missing
+cp .env.example .env         # then put GOOGLE_API_KEY=... in .env (never commit it)
+streamlit run app.py
 ```
 
-Pass the key at runtime (`-e` or Cloud Run / Secret Manager). Do not copy `.env` into the image.
+Without a key the app runs in a **labelled STUB mode** (rule-based, no model) so you can still demo the UI, the schema inspector and the migration button. With a key the sidebar shows "Live mode" and each answer shows `Mode: live (gemini-3.5-flash)`. If a live call fails, the app falls back to the stub and prints the reason with the key masked.
 
-Cloud Run: deploy the same image, set `PORT` (the Dockerfile defaults to 8080), inject `GOOGLE_API_KEY` as a secret, and allow scale-to-zero. Vertex AI Agent Engine is the other course target — package the same `root_agent` if that is how Lab day is marked.
+Demo script: ask "Which tables exist?", press **Add table 'supplier_lead_times'**, ask "What are the supplier lead times for EXAMPLE-RESIN-001?", then try the injection and `DROP TABLE` samples.
 
-## What the pipeline does
+## Deploy on Streamlit Community Cloud
 
-`quotation_pipeline` is a `SequentialAgent` (Day 2 Lab 4):
+1. Push this folder to a GitHub repo (branch `main`). Check `.env` and `.streamlit/secrets.toml` are not committed. `data/enterprise.db` should be committed (it is recreated automatically if missing).
+2. Go to [share.streamlit.io](https://share.streamlit.io) -> **New app**. Pick the repo, branch `main`, main file `app.py`.
+3. **Advanced settings**: choose Python 3.11 and open **Secrets**. Paste:
+   ```toml
+   GOOGLE_API_KEY = "your-key-from-google-ai-studio"
+   ```
+4. Click **Deploy**. The key lives only in Streamlit Secrets, read through `st.secrets`.
 
-1. `intake_parser` → `output_key="enquiry"`
-2. `ParallelAgent` `research`: past-quote RAG, pricing, stock (`past_quotes`, `pricing`, `stock`)
-3. `quote_drafter` → `quote_draft`
-4. `LoopAgent` `review_loop` (`max_iterations=2`): judge then refine
-5. Streamlit Approve / Reject writes `data/audit.jsonl` only (no send)
+Notes: the Cloud filesystem is not persistent. A table added with the migration button and the audit log reset when the app restarts; the committed database is the baseline. The cost widget is per browser session; `STATS` in `agent/telemetry.py` is process-wide.
 
-Guardrails (Lab 2 notebook `block_injection` / Day 3 preview): `before_model_callback` blocks prompt injection and redacts PII; a deterministic price-floor check runs before Approve is enabled.
+Docker (optional): `docker build -t quotation-assistant . && docker run -p 8080:8080 -e GOOGLE_API_KEY quotation-assistant`.
 
-## Source mapping (summary)
+## Evaluation (LLM-as-a-Judge)
 
-| Piece | Session |
-| --- | --- |
-| Workflow + human approval, not a free send-agent | Day 1 p.15–16, p.31, p.46, p.51; Day 2 p.46 |
-| `agent.py` / `tools.py` / `prompts.py` / `.env` / `adk web` | Day 1 Block 2 · Lab 1 · p.62, p.72, p.81 |
-| Default `MODEL = "gemini-3.5-flash"` (LiteLLM only to swap providers) | Lab 1 / Lab 4 / Lab 5 notebooks; Day 1 p.43–44, p.79 |
-| Tool docstrings, few tools | Day 1 Lab 2 · p.36, p.38, p.87 |
-| `before_model_callback` / `block_injection` | Lab 2 notebook; Day 1 p.84, p.87 |
-| PII redaction + tool authorisation | Day 3, previewed Day 1 p.84 |
-| Past-quote RAG | Day 1 Lab 3 (RAG is Lab 3 — not this capstone number) · p.116–117 |
-| Sequential / Parallel / Loop + `output_key` | Day 2 Lab 4 / 4a · p.12–18, p.24 |
-| Optional later `AgentTool` follow-ups | Day 2 Lab 5 · p.44–47 |
-| MCP `tool_filter` for stock | Day 2 Lab 6 · p.69, p.75 |
-| LLM-as-judge, golden set, cost | Day 1 p.48–49; Day 3 outline |
-| Langfuse tracing | Day 3 course outline (not named in Day 1–2 PDFs) |
-| Cloud Run / Agent Engine | Day 1 p.80 |
-| Streamlit UI | FDE class notes + lecturer; Community Cloud = General practice |
+```bash
+python eval.py          # live if GOOGLE_API_KEY is set, otherwise labelled STUB
+python eval.py --stub   # force the offline stub
+```
 
-See the table in `GUIDE.md` for slide-level detail.
+`data/capstone_golden.json` has 7 cases: two normal quotes, a stock shortfall, a prompt injection, a SQL mutation attempt, a policy question and a below-floor price request. For each case the coordinator answers, then a **separate judge agent** scores the answer 1 to 5 against the reference (5 accurate and grounded, 3 partial, 1 hallucinated, wrong or unsafe). The run writes `eval_report.md` with per-case scores, the average and the telemetry spend.
 
-## Data
+The `eval_report.md` committed here is a **STUB run** (rule-based, no model). It checks that the data, guardrails and tools work; it is not an LLM-as-a-Judge benchmark. Run `python eval.py` with your key and use that report and its spend for the submission.
 
-- `data/example_past_quotes.csv` — fictional example rows only (`EXAMPLE_CUSTOMER_A`, `EXAMPLE-RESIN-001`, …).
-- `data/golden_set.json` — 10 fictional test cases from the draft.
-- `data/audit.jsonl` is created at runtime and is gitignored.
+## Tests
+
+```bash
+pip install pytest
+python -m pytest tests -q
+```
+
+Covers `is_sql_mutation` (block and allow), the read-only connection, PII and injection guardrails, the cost tracker, the full ADK agent graph on a scripted fake model (including AgentTool children), the stub eval, and `streamlit.testing` `AppTest` for `app.py` (including the migration button). Tests use a temporary copy of the database.
+
+## Secrets and privacy
+
+- The Google API key is never in code, chat, Codeshare or GitHub. Use `.env` (local) or Streamlit Secrets (Cloud). `.env.example` and `.streamlit/secrets.toml.example` hold placeholders only.
+- Example data only. PII is masked before any text reaches a model.
+- `data/audit.jsonl` (approve / reject log) is created at run time and is git-ignored.

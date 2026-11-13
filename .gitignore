@@ -3,7 +3,9 @@
 !.env.example
 .streamlit/secrets.toml
 __pycache__/
+*.pyc
 .venv/
 venv/
 data/audit.jsonl
-*.pyc
+eval_report.md.tmp
+.pytest_cache/

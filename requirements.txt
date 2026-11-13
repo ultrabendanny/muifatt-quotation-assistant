@@ -1,7 +1,7 @@
 google-adk
-litellm
 google-genai
 streamlit
+sqlparse
 python-dotenv
 pandas
 fpdf2>=2.7

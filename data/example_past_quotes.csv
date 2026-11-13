@@ -1,6 +1,0 @@
-quote_date,buyer_label,sku,description,qty,uom,unit_price,currency,incoterms,lead_time_days,notes
-2026-08-15,EXAMPLE_CUSTOMER_A,EXAMPLE-RESIN-001,"EXAMPLE general-purpose resin, 25kg bag",500,KG,4.80,MYR,EXW,3,Example row only — not a real quote
-2026-09-02,EXAMPLE_CUSTOMER_B,EXAMPLE-RESIN-001,"EXAMPLE general-purpose resin, 25kg bag",2000,KG,4.65,MYR,EXW,5,Example row only — not a real quote
-2026-07-21,EXAMPLE_CUSTOMER_C,EXAMPLE-ADDITIVE-002,"EXAMPLE processing additive, 20kg pail",200,KG,11.00,MYR,FOB,7,Example row only — not a real quote
-2026-06-10,EXAMPLE_CUSTOMER_A,EXAMPLE-FILM-003,EXAMPLE packaging film roll,1,ROLL,8.00,MYR,EXW,10,Example row only — not a real quote
-2026-10-01,EXAMPLE_CUSTOMER_D,EXAMPLE-RESIN-001,"EXAMPLE general-purpose resin, 25kg bag",2,MT,4650.00,MYR,CIF,14,"Example row only — MT price is illustrative, not real"

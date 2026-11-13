@@ -6,7 +6,7 @@ Use this to explain the project. Example data only. For the architecture paragra
 
 | File | What it does | Course lab / pillar |
 | --- | --- | --- |
-| `app.py` | Streamlit UI: Quote tab, Ask-the-analyst chat, sidebar schema inspector (`st.text`), live migration simulator, cost widget, Approve and PDF | Pillar 6, Capstone Step 9; Lab 1 key handling |
+| `app.py` | Streamlit UI: Quote tab, Ask-the-analyst chat, Evaluation tab (runs the judge harness live), sidebar schema inspector (`st.text`), live migration simulator, cost widget, Approve and PDF | Pillar 6, Capstone Step 9; Lab 1 key handling |
 | `agent/agent.py` | `enterprise_analyst_agent` coordinator, three specialists, `quotation_pipeline`, judge agent, session helper, stub fallback | Pillar 1; Lab 4 (Sequential / Parallel + `output_key`), Lab 5 (`AgentTool`), Lab 1 (`Runner`) |
 | `agent/mcp_tools.py` | `mcp_list_tables`, `mcp_describe_table`, `mcp_read_query`, `mcp_list_policies`, `mcp_read_policy`, `is_sql_mutation` | Pillar 2 and 3 (data level); Lab 6 |
 | `agent/db.py` | Database path, seed data, `connect_ro()` (`mode=ro`), the human-only write path for the migration | Pillar 2; Capstone Steps 3 and 8 |
@@ -16,7 +16,7 @@ Use this to explain the project. Example data only. For the architecture paragra
 | `agent/prompts.py` | Agent instructions, no schema or prices inside; judge rubric | Lab 4 placeholders; Lab 7 judge |
 | `agent/stub.py` | Offline rule-based engine, always labelled STUB | Fallback so the demo and eval run without a key |
 | `agent/quote_pdf.py` | In-memory PDF (fpdf2) for `st.download_button` | Approve flow (not an agent tool) |
-| `eval.py` | Judge harness, writes `eval_report.md` | Pillar 5; Lab 7 `EvalHarness` |
+| `eval.py` | Judge harness (CLI and the app's Evaluation tab), writes `eval_report.md` | Pillar 5; Lab 7 `EvalHarness` |
 | `data/enterprise.db` | SQLite: `products`, `price_rules`, `stock`, `customers`, `past_quotes` | Pillar 2 |
 | `data/capstone_golden.json` | 7 golden cases | Pillar 5 |
 | `policies/*.md` | `quoting_policy`, `stock_and_lead_time`, `compliance_handbook` (price and stock rules) | Pillar 2; Lab 6 documents |
@@ -38,4 +38,4 @@ Use this to explain the project. Example data only. For the architecture paragra
 3. Quote tab: "Below-floor price" shows the floor warning.
 4. Ask the analyst: "Which tables exist?", press **Add table 'supplier_lead_times'**, ask about supplier lead times.
 5. Ask the analyst: the injection sample, then the `DROP TABLE` sample.
-6. Show the sidebar cost widget and `eval_report.md`.
+6. Evaluation tab: show the 7 golden cases, press **Run evaluation**, point at the average, pass count and spend, download the report. Then show the sidebar cost widget.

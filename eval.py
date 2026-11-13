@@ -65,34 +65,62 @@ def parse_judge(raw: str) -> tuple[int, str, bool]:
         return 1, "judge output could not be parsed", True
 
 
-def run_eval(stub: bool, golden_path: Path = GOLDEN, report_path: Path | None = REPORT) -> dict:
-    golden = json.loads(Path(golden_path).read_text(encoding="utf-8"))["cases"]
+PASS_THRESHOLD = 4  # a case passes at 4 or 5
+
+
+def load_golden(golden_path: Path = GOLDEN) -> list[dict]:
+    return json.loads(Path(golden_path).read_text(encoding="utf-8"))["cases"]
+
+
+def run_eval(stub: bool, golden_path: Path = GOLDEN, report_path: Path | None = REPORT,
+             progress=None) -> dict:
+    """Run every golden case. Used by the CLI and by the Streamlit Evaluation tab.
+
+    progress(done, total, next_case) is called before each case and once at the end
+    (next_case is None). A failure in one case is recorded on that case and the run continues.
+    """
+    golden = load_golden(golden_path)
     live = (not stub) and api_key_present()
     start = telemetry.snapshot()
-    judge_session = AgentChatSession(build_judge_agent(), app_name="eval_judge") if live else None
 
     results = []
-    for case in golden:
-        reply = ask_analyst(case["question"],
-                            session=new_chat_session() if live else None,
-                            force_stub=not live)
-        answer = reply["answer"]
-        if live and reply["mode"] == "live":
-            raw = judge_session.send(
-                f"Question: {case['question']}\nReference Answer: {case['reference']}\nActual Answer: {answer}\n"
-            )
-            score, reason, parse_error = parse_judge(raw)
-            judge_kind = "llm"
-        else:
-            score, reason = stub_judge(case, answer)
-            parse_error, judge_kind = False, "stub"
-        results.append({"id": case["id"], "category": case["category"], "score": score, "reason": reason,
-                        "answer": answer, "judge": judge_kind, "candidate_mode": reply["mode"],
-                        "parse_error": parse_error})
+    for i, case in enumerate(golden):
+        if progress:
+            progress(i, len(golden), case)
+        row = {"id": case["id"], "category": case["category"], "question": case["question"], "score": None,
+               "reason": "", "answer": "", "judge": "stub", "candidate_mode": "stub", "parse_error": False,
+               "error": None}
+        try:
+            reply = ask_analyst(case["question"],
+                                session=new_chat_session() if live else None,
+                                force_stub=not live)
+            row.update(answer=reply["answer"], candidate_mode=reply["mode"], error=reply.get("error") if live else None)
+            if live and reply["mode"] == "live":
+                # a fresh judge session per case, so earlier cases cannot influence the score
+                judge = AgentChatSession(build_judge_agent(), app_name="eval_judge")
+                raw = judge.send(
+                    f"Question: {case['question']}\nReference Answer: {case['reference']}\n"
+                    f"Actual Answer: {reply['answer']}\n"
+                )
+                row["score"], row["reason"], row["parse_error"] = parse_judge(raw)
+                row["judge"] = "llm"
+            else:
+                row["score"], row["reason"] = stub_judge(case, reply["answer"])
+        except Exception as exc:  # keep going: report this case as errored
+            key = os.environ.get("GOOGLE_API_KEY")
+            msg = f"{type(exc).__name__}: {str(exc)}"
+            row.update(score=None, error=msg.replace(key, "[REDACTED_KEY]") if key else msg,
+                       reason="case errored, not scored")
+        results.append(row)
+    if progress:
+        progress(len(golden), len(golden), None)
 
-    avg = sum(r["score"] for r in results) / len(results)
-    usage = telemetry.delta(start)
-    out = {"mode": "live" if live else "stub", "model": MODEL, "average": avg, "results": results, "usage": usage,
+    scored = [r["score"] for r in results if r["score"] is not None]
+    out = {"mode": "live" if live else "stub", "model": MODEL,
+           "average": sum(scored) / len(scored) if scored else 0.0,
+           "passed": sum(1 for r in results if r["score"] is not None and r["score"] >= PASS_THRESHOLD),
+           "errored": sum(1 for r in results if r["score"] is None),
+           "results": results, "usage": telemetry.delta(start),
            "all_live": all(r["candidate_mode"] == "live" and r["judge"] == "llm" for r in results)}
     if report_path:
         Path(report_path).write_text(render_report(out), encoding="utf-8")
@@ -115,10 +143,13 @@ def render_report(out: dict) -> str:
               f"- Mode: **{'STUB' if stub else 'LIVE'}**",
               f"- Cases: {len(out['results'])}",
               f"- **Average score: {out['average']:.2f} / 5.0**",
-              f"- Cases scoring 4 or more: {sum(r['score'] >= 4 for r in out['results'])} / {len(out['results'])}", "",
+              f"- Passed (score 4 or more): {out['passed']} / {len(out['results'])}",
+              f"- Errored cases (not scored, excluded from the average): {out['errored']}", "",
               "## Per-case scores", "", "| Case | Category | Score | Judge | Reasoning |", "| --- | --- | --- | --- | --- |"]
     for r in out["results"]:
-        lines.append(f"| {r['id']} | {r['category']} | {r['score']}/5 | {r['judge']} | {r['reason'].replace('|', '/')} |")
+        score = f"{r['score']}/5" if r["score"] is not None else "error"
+        reason = (r["reason"] + (f" ({r['error']})" if r.get("error") else "")).replace("|", "/")
+        lines.append(f"| {r['id']} | {r['category']} | {score} | {r['judge']} | {reason} |")
     u = out["usage"]
     lines += ["", "## Telemetry spend (estimated)", "",
               f"- Model calls: {u['calls']}",
@@ -132,7 +163,7 @@ def render_report(out: dict) -> str:
     lines += ["", "## Answers", ""]
     for r in out["results"]:
         snippet = r["answer"].strip().replace("\n", "\n> ")
-        lines += [f"### {r['id']} ({r['score']}/5)", "", f"> {snippet}", ""]
+        lines += [f"### {r['id']} ({r['score'] if r['score'] is not None else 'error'}/5)", "", f"> {snippet}", ""]
     return "\n".join(lines)
 
 
@@ -144,6 +175,7 @@ if __name__ == "__main__":
     label = "STUB (rule-based, not LLM-as-a-Judge)" if not result["all_live"] else "LIVE"
     print(f"{label}: average {result['average']:.2f} / 5.0 over {len(result['results'])} cases")
     for r in result["results"]:
-        print(f"  {r['id']:<26} {r['score']}/5  {r['reason']}")
+        print(f"  {r['id']:<26} {r['score']}/5  {r['reason']}" if r["score"] is not None
+              else f"  {r['id']:<26} ERROR  {r['error']}")
     print(f"Report written to {REPORT}")
     sys.exit(0)

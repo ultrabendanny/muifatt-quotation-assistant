@@ -38,7 +38,7 @@ streamlit run app.py
 
 Without a key the app runs in a **labelled STUB mode** (rule-based, no model) so you can still demo the UI, the schema inspector and the migration button. With a key the sidebar shows "Live mode" and each answer shows `Mode: live (gemini-3.5-flash)`. If a live call fails, the app falls back to the stub and prints the reason with the key masked.
 
-Demo script: ask "Which tables exist?", press **Add table 'supplier_lead_times'**, ask "What are the supplier lead times for EXAMPLE-RESIN-001?", then try the injection and `DROP TABLE` samples.
+Demo script: ask "Which tables exist?", press **Add table 'supplier_lead_times'**, ask "What are the supplier lead times for EXAMPLE-RESIN-001?", then try the injection and `DROP TABLE` samples, then open the **Evaluation** tab and press **Run evaluation**.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -56,12 +56,14 @@ Docker (optional): `docker build -t quotation-assistant . && docker run -p 8080:
 
 ## Evaluation (LLM-as-a-Judge)
 
+You can run it **inside the app**: open the **Evaluation (LLM-as-a-Judge)** tab, read the 7 cases, press **Run evaluation** (progress bar, results table, average, pass count, token and USD spend) and download the markdown report. It is the same code as `eval.py`. With a key it is labelled LIVE and uses real model calls; without one it is labelled STUB and is not a real benchmark. Or from a terminal:
+
 ```bash
 python eval.py          # live if GOOGLE_API_KEY is set, otherwise labelled STUB
 python eval.py --stub   # force the offline stub
 ```
 
-`data/capstone_golden.json` has 7 cases: two normal quotes, a stock shortfall, a prompt injection, a SQL mutation attempt, a policy question and a below-floor price request. For each case the coordinator answers, then a **separate judge agent** scores the answer 1 to 5 against the reference (5 accurate and grounded, 3 partial, 1 hallucinated, wrong or unsafe). The run writes `eval_report.md` with per-case scores, the average and the telemetry spend.
+Pass means a score of 4 or 5. `data/capstone_golden.json` has 7 cases: two normal quotes, a stock shortfall, a prompt injection, a SQL mutation attempt, a policy question and a below-floor price request. For each case the coordinator answers, then a **separate judge agent** scores the answer 1 to 5 against the reference (5 accurate and grounded, 3 partial, 1 hallucinated, wrong or unsafe). The run writes `eval_report.md` with per-case scores, the average and the telemetry spend.
 
 The `eval_report.md` committed here is a **STUB run** (rule-based, no model). It checks that the data, guardrails and tools work; it is not an LLM-as-a-Judge benchmark. Run `python eval.py` with your key and use that report and its spend for the submission.
 

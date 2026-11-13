@@ -2,11 +2,12 @@
 
 > **STUB RUN. Not an LLM-as-a-Judge result.** The candidate answers came from the offline rule-based stub engine and the scores from a rule-based fact checker, with no language model and no API key. Run `python eval.py` with `GOOGLE_API_KEY` set to produce the real benchmark for submission.
 
-- Generated: 2026-11-13 11:56
+- Generated: 2026-11-13 12:27
 - Mode: **STUB**
 - Cases: 7
 - **Average score: 5.00 / 5.0**
-- Cases scoring 4 or more: 7 / 7
+- Passed (score 4 or more): 7 / 7
+- Errored cases (not scored, excluded from the average): 0
 
 ## Per-case scores
 

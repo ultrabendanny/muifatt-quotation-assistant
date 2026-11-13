@@ -21,6 +21,7 @@ from agent.db import MIGRATION_TABLE, apply_live_migration, ensure_database, res
 from agent.guardrails import append_audit
 from agent.mcp_tools import mcp_list_policies, mcp_list_tables, schema_text
 from agent.quote_pdf import format_quote_pdf
+import eval as eval_harness  # eval.py: the same harness the command line uses
 from agent.telemetry import PRICE_PER_M_COMPLETION, PRICE_PER_M_PROMPT, estimate_usd
 
 load_dotenv()  # local .env; a no-op on Streamlit Cloud
@@ -105,7 +106,7 @@ with st.sidebar:
 st.title("Quotation Assistant")
 st.caption("Internal draft only. Example data. A human must approve: this app does not send quotes.")
 
-tab_quote, tab_chat = st.tabs(["Quote", "Ask the analyst"])
+tab_quote, tab_chat, tab_eval = st.tabs(["Quote", "Ask the analyst", "Evaluation (LLM-as-a-Judge)"])
 
 SAMPLES = {
     "Normal quote": "Please quote 500 KG of EXAMPLE-RESIN-001 for Example Customer A.",
@@ -233,6 +234,74 @@ with tab_chat:
                 st.markdown(msg["content"])
                 if msg["role"] == "assistant":
                     st.caption(f"Mode: live ({MODEL})")
+
+with tab_eval:
+    cases = eval_harness.load_golden()
+    live_eval = api_key_present()
+    st.subheader("Evaluation harness (Pillar 5)")
+    st.markdown(
+        f"- **{len(cases)} golden cases** from `data/capstone_golden.json`: normal quotes, a stock shortfall, "
+        "a prompt injection, a SQL mutation attempt, a policy question and a below-floor price request.\n"
+        "- Each case is answered by the coordinator agent, then scored by a **separate judge agent** that sees the "
+        "question, a reference answer and the actual answer.\n"
+        "- **Rubric (1 to 5):** 5 accurate and grounded, 3 partially correct, 1 hallucinated, wrong or unsafe.\n"
+        f"- **Pass at {eval_harness.PASS_THRESHOLD} or more.**"
+    )
+    with st.expander(f"The {len(cases)} golden cases (before running)"):
+        st.dataframe(pd.DataFrame([{"id": c["id"], "category": c["category"], "question": c["question"]}
+                                   for c in cases]), width="stretch", hide_index=True)
+    if live_eval:
+        st.info(f"LIVE: runs on {MODEL} with a separate judge agent. It makes real model calls and uses your API quota.")
+    else:
+        st.warning("STUB mode: no GOOGLE_API_KEY. The run uses the offline rule-based engine and a rule-based "
+                   "fact checker. It is NOT a real LLM-as-a-Judge benchmark.")
+
+    if st.button("Run evaluation", type="primary", key="run_eval"):
+        bar = st.progress(0.0, text=f"Case 0/{len(cases)}")
+
+        def on_progress(done, total, case):
+            label = f"Case {min(done + 1, total)}/{total}: {case['id']}" if case else f"Done: {total}/{total} cases"
+            bar.progress(done / total, text=label)
+
+        eval_out = eval_harness.run_eval(stub=not live_eval, report_path=None, progress=on_progress)
+        bar.empty()
+        add_spend(eval_out["usage"])
+        st.session_state["eval_out"] = eval_out
+
+    eval_out = st.session_state.get("eval_out")
+    if eval_out:
+        is_live = eval_out["all_live"]
+        if is_live:
+            st.success(f"LIVE results ({eval_out['model']}, LLM-as-a-Judge).")
+        else:
+            st.warning("STUB results. Not a real benchmark: rule-based answers scored by a rule-based fact "
+                       "checker, no language model. Add GOOGLE_API_KEY and run again for the real score.")
+        rows = []
+        for r in eval_out["results"]:
+            rows.append({
+                "case": r["id"], "category": r["category"],
+                "score (1-5)": r["score"] if r["score"] is not None else "error",
+                "result": "ERROR" if r["score"] is None else ("PASS" if r["score"] >= eval_harness.PASS_THRESHOLD else "FAIL"),
+                "judge": r["judge"],
+                "judge reason": r["reason"] + (f" [{r['error']}]" if r.get("error") else ""),
+                "answer (truncated)": (r["answer"][:160] + "...") if len(r["answer"]) > 160 else r["answer"],
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        total = len(eval_out["results"])
+        u = eval_out["usage"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Average score", f"{eval_out['average']:.2f} / 5")
+        m2.metric("Passed", f"{eval_out['passed']}/{total}")
+        m3.metric("Tokens used", f"{u['total_tokens']:,}")
+        m4.metric("Estimated spend (USD)", f"${u['usd']:.6f}")
+        if eval_out["errored"]:
+            st.error(f"{eval_out['errored']} case(s) errored and are excluded from the average.")
+        st.caption(f"Telemetry delta for this run: {u['calls']} model calls, {u['prompt_tokens']:,} prompt + "
+                   f"{u['completion_tokens']:,} completion tokens. Example rates "
+                   f"(${PRICE_PER_M_PROMPT}/1M in, ${PRICE_PER_M_COMPLETION}/1M out), check current Gemini pricing. "
+                   "The spend is also added to the sidebar cost widget.")
+        st.download_button("Download eval report (markdown)", data=eval_harness.render_report(eval_out).encode("utf-8"),
+                           file_name="eval_report.md", mime="text/markdown")
 
 # ----------------------------------------------------------------- cost widget (Pillar 4)
 with cost_box:

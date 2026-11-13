@@ -54,3 +54,25 @@ def test_app_live_mode_banner_and_chat(monkeypatch):
     assert any("Mode: live" in c.value for c in at.caption)
     sidebar_metrics = {m.label: m.value for m in at.sidebar.metric}
     assert sidebar_metrics["Prompt tokens"] != "0" and sidebar_metrics["Estimated spend (USD)"] != "$0.000000"
+
+
+def test_evaluation_tab_live_mode_with_fake_model(monkeypatch):
+    import eval as eval_mod
+    llm = _patch_fake(monkeypatch)
+    orig_judge = eval_mod.build_judge_agent
+    monkeypatch.setattr(eval_mod, "build_judge_agent", lambda model=None: orig_judge(llm))
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120).run()
+    assert not at.exception
+    assert any("LIVE: runs on" in i.value for i in at.main.info)
+    next(b for b in at.button if "Run evaluation" in b.label).click().run()
+    assert not at.exception
+    assert any("LIVE results" in s.value for s in at.success)
+    metrics = {m.label: m.value for m in at.main.metric}
+    assert metrics["Passed"] == "7/7" and metrics["Average score"] == "4.00 / 5"
+    assert metrics["Estimated spend (USD)"] != "$0.000000" and metrics["Tokens used"] != "0"
+    df = [d for d in at.dataframe if "score (1-5)" in d.value.columns][0].value
+    assert set(df["judge"]) == {"llm"}
+    # the eval spend was added to the sidebar cost widget
+    side = {m.label: m.value for m in at.sidebar.metric}
+    assert side["Prompt tokens"] != "0" and side["Estimated spend (USD)"] != "$0.000000"
+    assert [b.label for b in at.get("download_button")] == ["Download eval report (markdown)"]

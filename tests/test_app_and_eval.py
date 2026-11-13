@@ -25,7 +25,7 @@ def test_app_loads_without_exception_in_stub_mode():
     assert any("STUB mode" in i.value for i in at.sidebar.info)
     text = " ".join(t.value for t in at.sidebar.text)
     assert "TABLE price_rules" in text and "supplier_lead_times" not in text  # schema inspector uses st.text
-    assert [t.label for t in at.tabs] == ["Quote", "Ask the analyst"]
+    assert [t.label for t in at.tabs] == ["Quote", "Ask the analyst", "Evaluation (LLM-as-a-Judge)"]
 
 
 def test_migration_button_makes_new_table_discoverable_without_code_change():
@@ -78,3 +78,47 @@ def test_stub_answers_refuse_injection_and_mutation():
     ans = stub_answer("Please DROP TABLE stock")["answer"]
     assert "read-only" in ans and "price_rules" in json.loads(mcp_list_tables())["tables"] + ["price_rules"]
     assert "stock" in json.loads(mcp_list_tables())["tables"]
+
+
+def _eval_button(at):
+    return _button(at, "Run evaluation")
+
+
+def test_evaluation_tab_stub_mode():
+    at = _app()
+    assert not at.exception
+    assert any("NOT a real LLM-as-a-Judge benchmark" in w.value for w in at.warning)
+    assert [b.label for b in at.get("download_button")] == []  # nothing before running
+    _eval_button(at).click().run()
+    assert not at.exception
+    assert any("STUB results" in w.value and "Not a real benchmark" in w.value for w in at.warning)
+    metrics = {m.label: m.value for m in at.main.metric}
+    assert metrics["Average score"] == "5.00 / 5" and metrics["Passed"] == "7/7"
+    df = [d for d in at.dataframe if "score (1-5)" in d.value.columns][0].value
+    assert len(df) == 7 and set(df["result"]) == {"PASS"} and set(df["judge"]) == {"stub"}
+    assert [b.label for b in at.get("download_button")] == ["Download eval report (markdown)"]
+    # results survive an unrelated rerun
+    at.run()
+    assert any("STUB results" in w.value for w in at.warning)
+
+
+def test_evaluation_report_text_matches_cli_report():
+    out = eval_mod.run_eval(stub=True, report_path=None)
+    text = eval_mod.render_report(out)
+    assert "STUB RUN" in text and "Passed (score 4 or more): 7 / 7" in text
+
+
+def test_eval_continues_after_a_case_error(monkeypatch):
+    real = eval_mod.ask_analyst
+
+    def flaky(question, **kw):
+        if "DROP TABLE" in question:
+            raise RuntimeError("boom")
+        return real(question, **kw)
+
+    monkeypatch.setattr(eval_mod, "ask_analyst", flaky)
+    out = eval_mod.run_eval(stub=True, report_path=None)
+    assert out["errored"] == 1 and out["passed"] == 6 and len(out["results"]) == 7
+    bad = next(r for r in out["results"] if r["score"] is None)
+    assert "boom" in bad["error"]
+    assert "error" in eval_mod.render_report(out)

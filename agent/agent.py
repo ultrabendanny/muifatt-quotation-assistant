@@ -1,16 +1,20 @@
-# agent.py — quotation_pipeline wiring
-# Patterns taken from the class Colab notebooks (plus Day 1–2 slides):
-#   lab1_hello_world_adk_colab_participants.ipynb
-#     MODEL = "gemini-3.5-flash"; GOOGLE_GENAI_USE_VERTEXAI=FALSE;
-#     Runner + InMemorySessionService + auto_create_session=True;
-#     runner.run(...) (sync); genai_types.Part.from_text;
-#     LiteLlm(model="gemini/gemini-3.5-flash") only when swapping providers
-#   lab4_multi_agent_orchestration_colab_participants.ipynb
-#     SequentialAgent / ParallelAgent / LoopAgent + output_key + {placeholders}
-#   lab5_dynamic_routing_colab_participants.ipynb (and Danny's copy)
-#     same session/runner helper; AgentTool from google.adk.tools (optional later)
-#   lab2_multi_tool_agent_colab_participants.ipynb
-#     before_model_callback=block_injection on the agent
+# agent.py: the capstone agents (Capstone Step 6) and the functions that run them.
+#
+# Patterns taken from the class Colab notebooks:
+#   Lab 1   MODEL = "gemini-3.5-flash"; GOOGLE_GENAI_USE_VERTEXAI=FALSE;
+#           Runner + InMemorySessionService + auto_create_session=True; runner.run(...)
+#   Lab 4   SequentialAgent / ParallelAgent + output_key + {placeholders}
+#   Lab 5   coordinator with AgentTool specialists (load-bearing descriptions)
+#   Lab 6   mcp_* discovery tools, no mutation tool registered
+#   Lab 7   before_model_callback guardrail + after_model_callback cost tracker
+#
+# Pillar 1 (multi-agent):
+#   enterprise_analyst_agent   coordinator used by the chat tab and by eval.py
+#       tools: mcp_* discovery tools + AgentTool(data_pricing_analyst, policy_checker, quote_drafter)
+#   quotation_pipeline         SequentialAgent used by the "Quote" tab (structured result)
+#       intake_parser -> research[data_pricing_analyst || policy_checker] -> quote_drafter -> quote_reviewer
+#
+# Every agent carries both callbacks, so every model call is guarded and metered.
 
 from __future__ import annotations
 
@@ -20,107 +24,231 @@ import os
 import uuid
 from typing import Any
 
-from . import prompts
+from . import prompts, stub, telemetry
 from .guardrails import (
-    INJECTION,
+    BLOCK_MESSAGE,
     append_audit,
-    block_injection,
+    before_model_guardrail,
     enforce_price_floor,
+    looks_like_injection,
     redact_pii,
 )
-from .tools import check_stock, get_price_rule, search_past_quotes
+from .mcp_tools import MCP_DB_TOOLS, MCP_POLICY_TOOLS, MCP_TOOLS
 
 # Lab 1 / Lab 2 / Lab 4 / Lab 5 notebooks: use the Gemini Developer API, not Vertex.
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "FALSE")
 
-# Exact constant from the class labs (e.g. Lab 1 cell, Lab 5 cell 7).
-MODEL = "gemini-3.5-flash"
-
-# Optional override for a one-off test; default stays the class MODEL.
-MODEL = os.environ.get("MODEL", MODEL)
+# Exact constant from the class labs. Optional env override for one-off tests.
+MODEL = os.environ.get("MODEL", "gemini-3.5-flash")
 
 APP_NAME = "quotation_assistant"
 
 
-def _build_root_agent():
-    """Build the SequentialAgent pipeline the way Lab 4 assembles movie_pitch_team."""
-    from google.adk.agents import Agent, LoopAgent, ParallelAgent, SequentialAgent
+def _callbacks() -> dict:
+    return {
+        "before_model_callback": before_model_guardrail,
+        "after_model_callback": telemetry.after_model_cost_tracker,
+    }
 
-    intake_parser = Agent(
-        name="intake_parser",
-        model=MODEL,
-        instruction=prompts.INTAKE_PARSER,
-        output_key="enquiry",
-        before_model_callback=block_injection,
-    )
 
-    past_quote_retriever = Agent(
-        name="past_quote_retriever",
-        model=MODEL,
-        instruction=prompts.PAST_QUOTE_RETRIEVER,
-        tools=[search_past_quotes],
-        output_key="past_quotes",
-        before_model_callback=block_injection,
-    )
-    pricing_agent = Agent(
-        name="pricing_agent",
-        model=MODEL,
-        instruction=prompts.PRICING_AGENT,
-        tools=[get_price_rule],
-        output_key="pricing",
-        before_model_callback=block_injection,
-    )
-    stock_agent = Agent(
-        name="stock_agent",
-        model=MODEL,
-        instruction=prompts.STOCK_AGENT,
-        tools=[check_stock],
-        output_key="stock",
-        before_model_callback=block_injection,
-    )
-    research = ParallelAgent(
-        name="research",
-        sub_agents=[past_quote_retriever, pricing_agent, stock_agent],
-    )
+# --------------------------------------------------------------------------
+# Agent factories (new instances each call, so no agent ever has two parents)
+# --------------------------------------------------------------------------
+def build_specialists(model=None, for_pipeline: bool = False) -> dict:
+    """The three specialists. Pipeline versions read {state}, chat versions take a request."""
+    from google.adk.agents import Agent
 
+    model = model or MODEL
+    analyst_instruction = prompts.DATA_PRICING_ANALYST
+    policy_instruction = prompts.POLICY_CHECKER
+    if for_pipeline:
+        analyst_instruction += "\nEnquiry to research:\n{enquiry}\n"
+        policy_instruction += "\nEnquiry to check against policy:\n{enquiry}\n"
+
+    data_pricing_analyst = Agent(
+        name="data_pricing_analyst",
+        model=model,
+        description=(
+            "Looks up list prices, price floors, volume breaks, stock levels, lead times and "
+            "similar past quotes in the enterprise SQLite database. Use for any price, stock or "
+            "history question. Read-only."
+        ),
+        instruction=analyst_instruction,
+        tools=list(MCP_DB_TOOLS),
+        output_key="pricing_data" if for_pipeline else None,
+        **_callbacks(),
+    )
+    policy_checker = Agent(
+        name="policy_checker",
+        model=model,
+        description=(
+            "Reads the markdown policy documents (quoting policy, stock and lead time rules, "
+            "compliance handbook) and reports which rules apply and whether a request breaks one."
+        ),
+        instruction=policy_instruction,
+        tools=list(MCP_POLICY_TOOLS),
+        output_key="policy_notes" if for_pipeline else None,
+        **_callbacks(),
+    )
+    drafter_instruction = prompts.QUOTE_DRAFTER
+    if not for_pipeline:
+        drafter_instruction = (
+            drafter_instruction.replace("Enquiry: {enquiry}\n", "")
+            .replace("Data and pricing findings: {pricing_data}\n", "")
+            .replace("Policy findings: {policy_notes}\n", "")
+            .replace("Use ONLY the inputs below.", "Use ONLY the facts given in the request.")
+        )
     quote_drafter = Agent(
         name="quote_drafter",
-        model=MODEL,
-        instruction=prompts.QUOTE_DRAFTER,
-        output_key="quote_draft",
-        before_model_callback=block_injection,
+        model=model,
+        description=(
+            "Turns an enquiry plus price, stock and policy findings into a JSON draft quote. "
+            "Pass the enquiry and the findings in the request. It has no tools."
+        ),
+        instruction=drafter_instruction,
+        output_key="quote_draft" if for_pipeline else None,
+        **_callbacks(),
+    )
+    return {
+        "data_pricing_analyst": data_pricing_analyst,
+        "policy_checker": policy_checker,
+        "quote_drafter": quote_drafter,
+    }
+
+
+def build_enterprise_analyst_agent(model=None):
+    """Coordinator (Step 6): discovery tools + specialist AgentTools + both callbacks."""
+    from google.adk.agents import Agent
+    from google.adk.tools.agent_tool import AgentTool
+
+    specialists = build_specialists(model, for_pipeline=False)
+    return Agent(
+        name="enterprise_analyst_agent",
+        model=model or MODEL,
+        description="Coordinator for the quoting desk: delegates to data, policy and drafting specialists.",
+        instruction=prompts.COORDINATOR,
+        tools=[*MCP_TOOLS, *[AgentTool(agent=a) for a in specialists.values()]],
+        **_callbacks(),
     )
 
-    judge_agent = Agent(
-        name="judge_agent",
-        model=MODEL,
-        instruction=prompts.JUDGE_AGENT,
-        output_key="judge_review",
-        before_model_callback=block_injection,
-    )
-    refiner_agent = Agent(
-        name="refiner_agent",
-        model=MODEL,
-        instruction=prompts.REFINER_AGENT,
-        output_key="quote_draft",  # Lab 4 refiner overwrites the draft key
-        before_model_callback=block_injection,
-    )
-    review_loop = LoopAgent(
-        name="review_loop",
-        sub_agents=[judge_agent, refiner_agent],
-        max_iterations=2,
-    )
 
+def build_quotation_pipeline(model=None):
+    """Structured quote workflow for the Quote tab (Lab 4 style)."""
+    from google.adk.agents import Agent, ParallelAgent, SequentialAgent
+
+    model = model or MODEL
+    intake_parser = Agent(
+        name="intake_parser",
+        model=model,
+        instruction=prompts.INTAKE_PARSER,
+        output_key="enquiry",
+        **_callbacks(),
+    )
+    s = build_specialists(model, for_pipeline=True)
+    research = ParallelAgent(
+        name="research",
+        sub_agents=[s["data_pricing_analyst"], s["policy_checker"]],
+    )
+    quote_reviewer = Agent(
+        name="quote_reviewer",
+        model=model,
+        instruction=prompts.QUOTE_REVIEWER,
+        output_key="review",
+        **_callbacks(),
+    )
     return SequentialAgent(
         name="quotation_pipeline",
-        sub_agents=[intake_parser, research, quote_drafter, review_loop],
+        sub_agents=[intake_parser, research, s["quote_drafter"], quote_reviewer],
     )
 
 
-try:
-    root_agent = _build_root_agent()
-except Exception:  # google-adk may not be installed yet
-    root_agent = None
+def build_judge_agent(model=None):
+    """Separate judge (Lab 7 Page 5). Deliberately has NO data tools and no callbacks that block."""
+    from google.adk.agents import Agent
+
+    return Agent(
+        name="eval_judge",
+        model=model or MODEL,
+        instruction=prompts.JUDGE,
+        after_model_callback=telemetry.after_model_cost_tracker,
+    )
+
+
+# --------------------------------------------------------------------------
+# Running agents (same session helper as Lab 1 / 4 / 5 / 7)
+# --------------------------------------------------------------------------
+def _maybe_sync(value: Any) -> Any:
+    """Unwrap a coroutine if the installed ADK exposes an async session API."""
+    if not inspect.iscoroutine(value):
+        return value
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, value).result()
+
+
+class AgentChatSession:
+    """InMemorySessionService + Runner.run, as in the lab notebooks."""
+
+    def __init__(self, agent, app_name=APP_NAME, user_id="local-demo", state=None):
+        from google.adk.runners import Runner
+        from google.adk.sessions import InMemorySessionService
+
+        self.agent = agent
+        self.app_name = app_name
+        self.user_id = user_id
+        self.session_service = InMemorySessionService()
+        self.runner = Runner(
+            agent=agent, app_name=app_name,
+            session_service=self.session_service, auto_create_session=True,
+        )
+        self.session_id = f"session_{uuid.uuid4().hex[:8]}"
+        self.session = _maybe_sync(
+            self.session_service.create_session(
+                app_name=app_name, user_id=user_id, session_id=self.session_id, state=state or {},
+            )
+        )
+
+    def send(self, prompt: str) -> str:
+        from google.genai import types as genai_types
+
+        message = genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=prompt)])
+        events = _maybe_sync(
+            self.runner.run(user_id=self.user_id, session_id=self.session_id, new_message=message)
+        )
+        parts = []
+        for event in events:
+            if getattr(event, "content", None) and event.content.parts:
+                for part in event.content.parts:
+                    if getattr(part, "text", None):
+                        parts.append(part.text)
+        return "".join(parts)
+
+    def state(self) -> dict:
+        sess = self.session
+        fetched = _maybe_sync(
+            self.session_service.get_session(
+                app_name=self.app_name, user_id=self.user_id, session_id=self.session_id
+            )
+        )
+        if fetched is not None:
+            sess = fetched
+        return dict(getattr(sess, "state", {}) or {})
+
+
+def api_key_present() -> bool:
+    return bool(os.environ.get("GOOGLE_API_KEY", "").strip())
+
+
+def _mask(message: str) -> str:
+    key = os.environ.get("GOOGLE_API_KEY")
+    return message.replace(key, "[REDACTED_KEY]") if key else message
 
 
 def _as_dict(value: Any) -> Any:
@@ -140,222 +268,85 @@ def _as_dict(value: Any) -> Any:
     return value
 
 
-def _state_to_result(state: dict, raw_enquiry: str) -> dict:
+def new_chat_session(model=None) -> AgentChatSession:
+    """A persistent coordinator conversation (one per Streamlit session)."""
+    return AgentChatSession(build_enterprise_analyst_agent(model))
+
+
+def ask_analyst(question: str, session: AgentChatSession | None = None, force_stub: bool = False) -> dict:
+    """Ask the coordinator one question.
+
+    Returns {"answer", "mode": "live"|"stub", "blocked", "usage", "error"}.
+    Live mode needs GOOGLE_API_KEY. Any live failure falls back to the stub with a masked reason.
+    """
+    before = telemetry.snapshot()
+    if not force_stub and api_key_present():
+        try:
+            session = session or new_chat_session()
+            answer = session.send(question)
+            return {
+                "answer": answer,
+                "mode": "live",
+                "blocked": BLOCK_MESSAGE in answer,
+                "usage": telemetry.delta(before),
+                "error": None,
+            }
+        except Exception as exc:
+            result = stub.stub_answer(question)
+            result.update(mode="stub", usage=telemetry.delta(before),
+                          error=f"{type(exc).__name__}: {_mask(str(exc))}")
+            return result
+    result = stub.stub_answer(question)
+    result.update(mode="stub", usage=telemetry.delta(before),
+                  error=None if force_stub else "GOOGLE_API_KEY is not set")
+    return result
+
+
+def _state_to_result(state: dict) -> dict:
     enquiry = _as_dict(state.get("enquiry")) or {}
     quote_draft = _as_dict(state.get("quote_draft")) or {}
-    judge_review = _as_dict(state.get("judge_review")) or {}
-    pricing = _as_dict(state.get("pricing")) or {}
-    floor = enforce_price_floor(quote_draft, pricing)
-    if not floor["ok"]:
-        warnings = list(quote_draft.get("warnings") or []) if isinstance(quote_draft, dict) else []
-        warnings.append("Price floor check failed; not ready to approve.")
-        if isinstance(quote_draft, dict):
-            quote_draft = dict(quote_draft)
-            quote_draft["warnings"] = warnings
-        if isinstance(judge_review, dict):
-            judge_review = dict(judge_review)
-            judge_review["pass"] = False
-            judge_review.setdefault("issues", []).append("Deterministic price-floor check failed.")
+    review = _as_dict(state.get("review")) or {}
+    floor = enforce_price_floor(quote_draft)
+    if not floor["ok"] and isinstance(review, dict):
+        review = dict(review)
+        review["pass"] = False
+        review.setdefault("issues", []).append("Deterministic price-floor check failed.")
     return {
         "enquiry": enquiry,
-        "past_quotes": _as_dict(state.get("past_quotes")),
-        "pricing": pricing,
-        "stock": _as_dict(state.get("stock")),
+        "pricing_data": _as_dict(state.get("pricing_data")),
+        "policy_notes": _as_dict(state.get("policy_notes")),
         "quote_draft": quote_draft,
-        "judge_review": judge_review,
-        "cost_trace": _as_dict(state.get("cost_trace"))
-        or {"calls": 0, "total_usd_estimate": 0.0, "note": "Fill from Langfuse / token usage"},
+        "review": review,
+        "floor_check": floor,
         "approval_status": "pending",
-        "floor_check": {"ok": floor["ok"], "violations": floor["violations"]},
-        "raw_enquiry_preview": (raw_enquiry or "")[:80],
-        "used_stub": False,
     }
 
 
-def stub_result(raw_enquiry: str) -> dict:
-    """Example-only stub so the Streamlit UI can be demoed if ADK is not installed."""
-    return {
-        "enquiry": {
-            "buyer_label": "EXAMPLE_CUSTOMER_A",
-            "need_by": None,
-            "currency": "MYR",
-            "lines": [
-                {
-                    "line_no": 1,
-                    "product_query": (raw_enquiry[:80] if raw_enquiry else "EXAMPLE general-purpose resin"),
-                    "suggested_sku": "EXAMPLE-RESIN-001",
-                    "qty": 500,
-                    "uom": "KG",
-                    "target_price": None,
-                    "confidence": "medium",
-                }
-            ],
-            "parse_warnings": ["Stub result — ADK pipeline not run"],
-        },
-        "quote_draft": {
-            "quote_id": "DRAFT-EXAMPLE-001",
-            "example_only": True,
-            "currency": "MYR",
-            "validity_days": 14,
-            "lines": [
-                {
-                    "line_no": 1,
-                    "sku": "EXAMPLE-RESIN-001",
-                    "description": "EXAMPLE general-purpose resin, 25kg bag",
-                    "qty": 500,
-                    "uom": "KG",
-                    "unit_price": 5.00,
-                    "line_total": 2500.00,
-                    "lead_time_days": 3,
-                    "source": "price_rule",
-                }
-            ],
-            "subtotal": 2500.00,
-            "notes": ["Example figures only"],
-            "warnings": [],
-        },
-        "judge_review": {
-            "pass": True,
-            "total": 8,
-            "scores": {
-                "completeness": 2,
-                "floor_margin": 2,
-                "grounding": 1,
-                "consistency": 2,
-                "safety": 1,
-            },
-            "issues": ["Stub scores"],
-            "required_fixes": [],
-        },
-        "cost_trace": {"calls": 0, "total_usd_estimate": 0.00, "note": "Fill from Langfuse / token usage"},
-        "approval_status": "pending",
-        "used_stub": True,
-    }
+def run_quotation_pipeline(raw_enquiry: str, force_stub: bool = False) -> dict:
+    """Run the Quote tab pipeline. Always returns a dict the UI can render."""
+    text = raw_enquiry or ""
+    before = telemetry.snapshot()
 
-
-def _maybe_sync(value: Any) -> Any:
-    """Labs call create_session / get_session synchronously. Unwrap a coroutine if the installed ADK is async."""
-    if not inspect.iscoroutine(value):
-        return value
-    import asyncio
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(value)
-
-    # Streamlit (and similar) may already have a loop — run in a worker thread.
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, value).result()
-
-
-class AgentChatSession:
-    """Same helper as Lab 1 / Lab 4 / Lab 5 notebooks (InMemorySessionService + Runner.run).
-
-    Extra: after drain, read session.state so Streamlit can show output_key values.
-    """
-
-    def __init__(self, agent, app_name=APP_NAME, user_id="local-demo", state=None):
-        from google.adk.runners import Runner
-        from google.adk.sessions import InMemorySessionService
-
-        self.agent = agent
-        self.app_name = app_name
-        self.user_id = user_id
-        self.session_service = InMemorySessionService()
-        self.runner = Runner(
-            agent=self.agent,
-            app_name=self.app_name,
-            session_service=self.session_service,
-            auto_create_session=True,
-        )
-        self.session_id = f"session_{uuid.uuid4().hex[:8]}"
-        self.session = _maybe_sync(
-            self.session_service.create_session(
-                app_name=self.app_name,
-                user_id=self.user_id,
-                session_id=self.session_id,
-                state=state or {},  # seeds {raw_enquiry} used by the intake_parser prompt
-            )
-        )
-
-    def send(self, prompt: str) -> str:
-        from google.genai import types as genai_types
-
-        message = genai_types.Content(
-            role="user",
-            parts=[genai_types.Part.from_text(text=prompt)],
-        )
-        events = self.runner.run(
-            user_id=self.user_id,
-            session_id=self.session_id,
-            new_message=message,
-        )
-        # runner.run may itself be a coroutine in some ADK versions
-        events = _maybe_sync(events)
-        parts = []
-        for event in events:
-            if hasattr(event, "content") and event.content:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        parts.append(part.text)
-        return "".join(parts)
-
-    def state(self) -> dict:
-        sess = self.session
-        if hasattr(self.session_service, "get_session"):
-            fetched = _maybe_sync(
-                self.session_service.get_session(
-                    app_name=self.app_name,
-                    user_id=self.user_id,
-                    session_id=self.session_id,
-                )
-            )
-            if fetched is not None:
-                sess = fetched
-        return dict(getattr(sess, "state", {}) or {})
-
-
-def blocked_result(reason: str) -> dict:
-    """Result returned when the Lab 2 injection blocklist catches the enquiry up front."""
-    return {
-        "blocked": True,
-        "block_reason": reason,
-        "used_stub": False,
-        "approval_status": "blocked",
-    }
-
-
-def run_quotation_pipeline(raw_enquiry: str) -> dict:
-    """Run quotation_pipeline with the Lab 1/4/5 session helper; return output_key state."""
-    enquiry_text = raw_enquiry or ""
-
-    # Lab 2 guardrail, applied up front too: stop before any model call.
-    if any(p in enquiry_text.lower() for p in INJECTION):
+    # Tier 1, up front: a blocked enquiry must not reach any stage of the pipeline.
+    if looks_like_injection(text):
         append_audit({"event": "blocked", "reason": "prompt_injection", "sent": False})
-        return blocked_result("Request blocked by safety policy (prompt injection phrase).")
+        return {"blocked": True, "block_reason": BLOCK_MESSAGE, "mode": "live" if api_key_present() else "stub",
+                "approval_status": "blocked", "usage": telemetry.delta(before), "error": None}
 
-    if root_agent is None:
-        stub = stub_result(enquiry_text)
-        stub["pipeline_error"] = "root_agent not built (install google-adk from requirements.txt)."
-        return stub
-    try:
-        # The intake_parser prompt contains {raw_enquiry}; ADK raises
-        # "Context variable not found" unless that key exists in session state.
-        # Redact PII here because state is injected into the instruction, not
-        # into the contents that the before_model_callback inspects.
-        chat = AgentChatSession(root_agent, state={"raw_enquiry": redact_pii(enquiry_text)})
-        chat.send(redact_pii(enquiry_text))
-        out = _state_to_result(chat.state(), enquiry_text)
-        out["used_stub"] = False
-        return out
-    except Exception as exc:  # never show the key; type + message only
-        stub = stub_result(enquiry_text)
-        message = str(exc)
-        key = os.environ.get("GOOGLE_API_KEY")
-        if key:
-            message = message.replace(key, "[REDACTED_KEY]")
-        stub["pipeline_error"] = f"{type(exc).__name__}: {message}"
-        return stub
+    error = None
+    if not force_stub and api_key_present():
+        try:
+            clean = redact_pii(text)
+            chat = AgentChatSession(build_quotation_pipeline(), state={"raw_enquiry": clean})
+            chat.send(clean)
+            out = _state_to_result(chat.state())
+            out.update(mode="live", blocked=False, usage=telemetry.delta(before), error=None)
+            return out
+        except Exception as exc:  # never show the key: type + masked message only
+            error = f"{type(exc).__name__}: {_mask(str(exc))}"
+    elif not force_stub:
+        error = "GOOGLE_API_KEY is not set"
+    out = stub.stub_quote(text)
+    out.update(mode="stub", blocked=False, usage=telemetry.delta(before), error=error)
+    out["floor_check"] = enforce_price_floor(out["quote_draft"])
+    return out
